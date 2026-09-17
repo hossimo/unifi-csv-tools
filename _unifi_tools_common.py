@@ -158,18 +158,26 @@ class UniFiClient:
             raise UniFiError(f"GET {path} failed: HTTP {status} {msg}".rstrip())
         return payload
 
-    def post_integration(self, endpoint, body):
-        """POST a JSON body to an integration API path; returns the created object."""
+    def send_integration(self, endpoint, body, method="POST"):
+        """Send a JSON body to an integration API path; returns the saved object."""
         path = f"{API_PREFIX}{INTEGRATION_PREFIX}/{endpoint}"
-        status, payload = self._request(path, "POST", body)
+        status, payload = self._request(path, method, body)
         self._check_status(path, status)
-        if status not in (200, 201):
+        if status not in (200, 201, 204):
             if isinstance(payload, dict) and payload.get("message"):
                 detail = payload["message"]
             else:
                 detail = json.dumps(payload) if payload is not None else ""
-            raise UniFiError(f"POST {path} failed: HTTP {status} {detail}".rstrip())
+            raise UniFiError(f"{method} {path} failed: HTTP {status} {detail}".rstrip())
         return payload
+
+    def post_integration(self, endpoint, body):
+        """POST a JSON body to an integration API path; returns the created object."""
+        return self.send_integration(endpoint, body, "POST")
+
+    def put_integration(self, endpoint, body):
+        """PUT a JSON body to an integration API path; returns the updated object."""
+        return self.send_integration(endpoint, body, "PUT")
 
     def list_integration(self, endpoint):
         """Return every item from a paginated integration API list endpoint."""
@@ -207,6 +215,10 @@ class UniFiClient:
     def post_site(self, endpoint, body):
         """POST to a site-scoped integration endpoint, e.g. 'wifi/broadcasts'."""
         return self.post_integration(f"sites/{self.site_id()}/{endpoint}", body)
+
+    def put_site(self, endpoint, body):
+        """PUT to a site-scoped resource, e.g. 'wifi/broadcasts/<id>'."""
+        return self.put_integration(f"sites/{self.site_id()}/{endpoint}", body)
 
 
 def load_env_file(path):
@@ -424,7 +436,7 @@ Run one of these instead (add --help for options):
 
   unifi-tools-export-devices.py   Export devices and/or clients to CSV
   unifi-tools-export-wifi.py      Export WiFi networks (SSIDs) to CSV
-  unifi-tools-import-wifi.py      Create WiFi networks from a CSV
+  unifi-tools-import-wifi.py      Create or update WiFi networks from a CSV
 
 Example: python unifi-tools-export-wifi.py --host 192.168.1.1"""
     )

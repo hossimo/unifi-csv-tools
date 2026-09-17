@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-unifi-tools-import-wifi - Create UniFi WiFi networks (SSIDs) from a CSV file.
+unifi-tools-import-wifi - Create or update UniFi WiFi networks (SSIDs) from a CSV.
 
 Reads the CSV written by unifi-tools-export-wifi.py and creates each SSID via the
 official Network integration API (Network 10.1+). Uses the same connection
-options and API key as the export scripts. SSIDs whose name already exists
-are skipped, never changed. Standard library only, Python 3.8+.
+options and API key as the export scripts. SSIDs whose name already exists are
+skipped unless --update is given, which changes them to match the CSV instead;
+SSIDs are matched by name, so --update cannot rename one. Settings the CSV does
+not cover keep their current values. Standard library only, Python 3.8+.
 
 Only "SSID Name" is required. Blank cells fall back to defaults:
     Password          blank = open network
@@ -18,6 +20,7 @@ Only "SSID Name" is required. Blank cells fall back to defaults:
 Examples:
     python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --dry-run
     python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1
+    python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update
 """
 
 import argparse
@@ -46,9 +49,14 @@ ALLOWED_BANDS = (2.4, 5, 6)  # GHz, per the API schema
 PASSPHRASE_LENGTH = (8, 63)  # WPA personal limits
 FAST_ROAMING = False  # 802.11r; the API requires this setting for WPA security
 
+# Security settings a new SSID needs that the CSV does not cover. As with
+# WIFI_DEFAULTS, --update keeps whatever an existing SSID is set to.
+SECURITY_DEFAULTS = {"fastRoamingEnabled": FAST_ROAMING}
+
 # Settings sent with every new SSID that the CSV does not cover. All but
 # bandSteeringEnabled are required by the API. Values match an SSID created in
-# the UniFi UI; change them here to suit.
+# the UniFi UI; change them here to suit. --update leaves these alone on an
+# SSID that already exists, keeping whatever it is set to now.
 WIFI_DEFAULTS = {
     "type": "STANDARD",
     "multicastToUnicastConversionEnabled": False,
@@ -69,6 +77,10 @@ FILTER_ID_FIELDS = {
     "DEVICE_TAGS": "deviceTagIds",
     "DEVICES": "deviceIds",
 }
+
+# Fields the API reports but rejects in an update body ("Unknown request body
+# property"). Add any others the console complains about here.
+READ_ONLY_FIELDS = {"id", "metadata"}
 
 YES = {"yes", "y", "true", "1"}
 NO = {"no", "n", "false", "0"}
@@ -154,12 +166,13 @@ def parse_bands(value):
             raise RowError(f"Band '{item}' must be 2.4, 5, or 6 GHz")
     if len(set(bands)) != len(bands):
         raise RowError(f"Band '{value}' lists a frequency more than once")
-    return [int(b) if b.is_integer() else b for b in bands]
+    # Sorted so a row and the SSID it matches compare equal whatever their order
+    return [int(b) if b.is_integer() else b for b in sorted(bands)]
 
 
-def build_request(row, networks, device_tags, devices):
-    """Turn one CSV row into a create-WiFi-broadcast request body."""
-    body = {"name": row["name"], **WIFI_DEFAULTS}
+def build_fields(row, networks, device_tags, devices):
+    """Turn one CSV row into the WiFi broadcast fields the CSV controls."""
+    body = {"name": row["name"]}
 
     network = find_network(row, networks)
     body["network"] = {"type": "SPECIFIC", "networkId": network["id"]}
@@ -176,11 +189,7 @@ def build_request(row, networks, device_tags, devices):
         low, high = PASSPHRASE_LENGTH
         if not low <= len(password) <= high:
             raise RowError(f"Password must be {low}-{high} characters for {security}")
-        body["securityConfiguration"] = {
-            "type": security,
-            "passphrase": password,
-            "fastRoamingEnabled": FAST_ROAMING,
-        }
+        body["securityConfiguration"] = {"type": security, "passphrase": password}
 
     mode = row["broadcasting_aps"].lower() or "all"
     if mode != "all":
@@ -199,13 +208,78 @@ def build_request(row, networks, device_tags, devices):
             raise RowError(f"Broadcasting APs is {row['broadcasting_aps']} but {column} is blank")
         body["broadcastingDeviceFilter"] = {
             "type": filter_type,
-            FILTER_ID_FIELDS[filter_type]: ids,
+            FILTER_ID_FIELDS[filter_type]: sorted(ids),
         }
 
     body["broadcastingFrequenciesGHz"] = parse_bands(row["band"])
     body["hideName"] = parse_bool(row["hidden"], False, "Hidden")
     body["enabled"] = parse_bool(row["enabled"], True, "Enabled")
     return body
+
+
+def full_security(security, current=None):
+    """Security settings to send: the CSV's over the current ones, else defaults."""
+    if security.get("type") == OPEN_SECURITY:
+        return security
+    # Keep what the CSV does not cover (PMF mode, fast roaming, SAE) when the
+    # SSID already uses this security type; fall back to the defaults when not.
+    base = current if current and current.get("type") == security.get("type") else None
+    return {**(base or SECURITY_DEFAULTS), **security}
+
+
+def apply_api_rules(body):
+    """Settle settings the API refuses to accept together; returns the body."""
+    if len(body.get("broadcastingFrequenciesGHz") or []) < 2:
+        # The API rejects the setting outright on one band, even when it is off:
+        # "band steering setting requires broadcasting on multiple bands"
+        body.pop("bandSteeringEnabled", None)
+    return body
+
+
+def create_body(fields):
+    """Request body for a new SSID: the CSV fields over the shared defaults."""
+    body = {**WIFI_DEFAULTS, **fields}
+    body["securityConfiguration"] = full_security(fields["securityConfiguration"])
+    return apply_api_rules(body)
+
+
+def update_body(current, fields, default_network_id=None):
+    """Request body that changes only what the CSV covers, keeping the rest."""
+    body = {k: v for k, v in current.items() if k not in READ_ONLY_FIELDS}
+    if "broadcastingDeviceFilter" not in fields:
+        body.pop("broadcastingDeviceFilter", None)  # Broadcasting APs is All
+    body.update(fields)
+
+    body["securityConfiguration"] = full_security(
+        fields["securityConfiguration"], current.get("securityConfiguration")
+    )
+
+    # An SSID on the default network reports it as NATIVE rather than by ID
+    network = current.get("network") or {}
+    if network.get("type") == "NATIVE" and (
+        (fields.get("network") or {}).get("networkId") == default_network_id
+    ):
+        body["network"] = network
+    return apply_api_rules(body)
+
+
+def normalized(field, value):
+    """A field value with list order dropped where the order means nothing."""
+    if field == "broadcastingFrequenciesGHz" and isinstance(value, list):
+        return sorted(value)
+    if field == "broadcastingDeviceFilter" and isinstance(value, dict):
+        return {k: sorted(v) if isinstance(v, list) else v for k, v in value.items()}
+    return value
+
+
+def changed_fields(current, body):
+    """Names of the fields where body differs from the SSID on the console."""
+    now = {k: v for k, v in current.items() if k not in READ_ONLY_FIELDS}
+    return sorted(
+        k
+        for k in set(body) | set(now)
+        if normalized(k, body.get(k)) != normalized(k, now.get(k))
+    )
 
 
 def redacted(body):
@@ -219,14 +293,19 @@ def redacted(body):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Create UniFi WiFi networks from a CSV (as written by unifi-tools-export-wifi.py)."
+        description="Create or update UniFi WiFi networks from a CSV (as written by unifi-tools-export-wifi.py)."
     )
     parser.add_argument("csv", help="CSV file to import")
     add_connection_args(parser)
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Change SSIDs that already exist to match the CSV (default: skip them)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show the requests that would be sent without creating anything",
+        help="Show the requests that would be sent without changing anything",
     )
     return parser.parse_args()
 
@@ -244,30 +323,74 @@ def main():
     if not client:
         return 1
 
-    existing = {w.get("name", "").lower() for w in client.list_site(WIFI_ENDPOINT)}
+    # SSIDs are matched by name; the first one wins if the site has duplicates
+    existing = {}
+    for wifi in client.list_site(WIFI_ENDPOINT):
+        existing.setdefault(wifi.get("name", "").lower(), wifi)
     networks = client.list_site(NETWORK_ENDPOINT)
     devices = client.list_site(DEVICE_ENDPOINT)
     device_tags = client.list_site(DEVICE_TAG_ENDPOINT)
+    default_network_id = next((n["id"] for n in networks if n.get("default")), None)
 
-    created = skipped = failed = 0
+    created = updated = unchanged = skipped = failed = 0
     seen = set()
     for line, row in enumerate(rows, start=2):  # Line 1 is the header
         name = row["name"]
         if not name:
             continue
         label = f"Line {line} '{name}'"
-        if name.lower() in existing or name.lower() in seen:
-            print(f"{label}: skipped, an SSID with this name already exists")
+        key = name.lower()
+        if key in seen:
+            print(f"{label}: skipped, an earlier line in this file uses the same name")
+            skipped += 1
+            continue
+        current = existing.get(key)
+        if current and not args.update:
+            print(
+                f"{label}: skipped, an SSID with this name already exists "
+                f"(use --update to change it)"
+            )
             skipped += 1
             continue
         try:
-            body = build_request(row, networks, device_tags, devices)
+            fields = build_fields(row, networks, device_tags, devices)
         except RowError as err:
             print(f"{label}: error, {err}", file=sys.stderr)
             failed += 1
             continue
-        seen.add(name.lower())
+        seen.add(key)
 
+        if current:
+            # The list may omit details such as the passphrase, so fetch the SSID
+            try:
+                detail = client.get_site(f"{WIFI_ENDPOINT}/{current['id']}")
+            except UniFiError as err:
+                print(f"{label}: error, {err}", file=sys.stderr)
+                failed += 1
+                continue
+            body = update_body(detail, fields, default_network_id)
+            changes = changed_fields(detail, body)
+            if not changes:
+                print(f"{label}: unchanged")
+                unchanged += 1
+                continue
+            changed = ", ".join(changes)
+            if args.dry_run:
+                print(f"{label}: would update ({changed})")
+                print(json.dumps(redacted(body), indent=2))
+                updated += 1
+                continue
+            try:
+                client.put_site(f"{WIFI_ENDPOINT}/{current['id']}", body)
+            except UniFiError as err:
+                print(f"{label}: error, {err}", file=sys.stderr)
+                failed += 1
+                continue
+            print(f"{label}: updated ({changed})")
+            updated += 1
+            continue
+
+        body = create_body(fields)
         if args.dry_run:
             print(f"{label}: would create")
             print(json.dumps(redacted(body), indent=2))
@@ -282,8 +405,12 @@ def main():
         print(f"{label}: created")
         created += 1
 
-    verb = "Would create" if args.dry_run else "Created"
-    print(f"{verb} {created}, skipped {skipped}, failed {failed}")
+    totals = [f"{'Would create' if args.dry_run else 'Created'} {created}"]
+    if args.update:
+        totals.append(f"{'update' if args.dry_run else 'updated'} {updated}")
+        totals.append(f"unchanged {unchanged}")
+    totals += [f"skipped {skipped}", f"failed {failed}"]
+    print(", ".join(totals))
     return 1 if failed else 0
 
 

@@ -1,6 +1,6 @@
 # unifi-csv-tools
 
-Export UniFi devices, clients, and WiFi networks from a UniFi OS console to timestamped CSVs, and create WiFi networks back from a CSV. Python 3.8+, no dependencies.
+Export UniFi devices, clients, and WiFi networks from a UniFi OS console to timestamped CSVs, and create or update WiFi networks back from a CSV. Python 3.8+, no dependencies.
 
 Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 
@@ -10,7 +10,7 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 |---|---|
 | [`python unifi-tools-export-devices.py --host <console>`](#devices-and-clients) | Export devices (and clients with `--what both`) to CSV |
 | [`python unifi-tools-export-wifi.py --host <console>`](#wifi-networks) | Export WiFi networks (SSIDs) to CSV |
-| [`python unifi-tools-import-wifi.py <file.csv> --host <console>`](#importing) | Create WiFi networks from a CSV; add `--dry-run` first |
+| [`python unifi-tools-import-wifi.py <file.csv> --host <console>`](#importing) | Create WiFi networks from a CSV, or update them with `--update`; add `--dry-run` first |
 
 All three take `--host` (required), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
 
@@ -82,18 +82,34 @@ Output: `exports/wifi/unifi_<site>_wifi_YYYYMMDD_HHMMSS.csv`, with columns `SSID
 
 ### Importing
 
-`unifi-tools-import-wifi.py` creates SSIDs from a CSV in the same format. It takes the connection options (`--host`, `--api-key`, `--port`, `--site`, `--verify-ssl`) plus `--dry-run`, which prints each request (password hidden) without changing anything.
+`unifi-tools-import-wifi.py` creates SSIDs from a CSV in the same format. It takes the connection options (`--host`, `--api-key`, `--port`, `--site`, `--verify-ssl`) plus `--update` (below) and `--dry-run`, which prints each request (password hidden) without changing anything.
 
 ```bash
 python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --dry-run
 python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1
+
+# Also change SSIDs that already exist to match the CSV
+python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update --dry-run
+python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update
 ```
 
-- Only `SSID Name` is required. SSIDs whose name already exists are skipped, never changed.
+- Only `SSID Name` is required. SSIDs whose name already exists are skipped, unless `--update` is given.
 - Blank cells use defaults: no password = open network, no `Network`/`VLAN` = the default network, `Broadcasting APs` = All, `Security` = `WPA2_PERSONAL`, `Band` = 2.4 and 5 GHz, `Hidden` = No, `Enabled` = Yes.
 - `Network` is matched by name, or by `VLAN` if the name is blank. `AP Groups` and `APs` are names separated by `;` and must match exactly one group or AP.
-- Other settings (band steering, client isolation, etc.) come from `WIFI_DEFAULTS` in `unifi-tools-import-wifi.py`.
+- New SSIDs take their other settings (band steering, client isolation, etc.) from `WIFI_DEFAULTS` in `unifi-tools-import-wifi.py`, and 802.11r fast roaming from `SECURITY_DEFAULTS`.
+- Band steering is dropped from the request when `Band` lists one frequency; the API rejects the setting outright on a single band.
 - Rows with problems are reported and skipped; the exit code is `1` if any row failed.
+
+#### Updating existing SSIDs
+
+`--update` changes SSIDs that already exist instead of skipping them, and still creates the ones that don't. Export the site first, edit that CSV, and import it back with `--update`.
+
+- SSIDs are matched by name, so `--update` cannot rename one; a renamed row creates a second SSID.
+- Only the columns the CSV covers are changed. Everything else (band steering, client isolation, fast roaming, PMF, WPA3/SAE, and the rest) keeps its current value, so `WIFI_DEFAULTS` and `SECURITY_DEFAULTS` apply to new SSIDs only. Changing `Security` to a different type does reset the settings belonging to it.
+- A blank cell is not "leave it alone", it is the default from the list above. A blank `Password` on an existing WPA network turns it into an open network.
+- Rows already matching the console are reported as `unchanged` and not sent. Each changed SSID lists the fields being written, and `--dry-run` prints the full request first.
+- The run is per row and not atomic: a failure partway through leaves the earlier rows changed.
+- If the console answers `400 Unknown request body property '$.x'`, add `x` to `READ_ONLY_FIELDS` in `unifi-tools-import-wifi.py`: it is a field the API reports but will not accept back.
 
 #### SSID limit per AP
 
