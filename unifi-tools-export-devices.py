@@ -6,9 +6,14 @@ Authenticates to a UniFi OS console (UDM, UCG, UDR, Cloud Key Gen2+) with an
 API key passed via --api-key or read from the environment or .env. Shared code
 lives in _unifi_tools_common.py. Standard library only, Python 3.8+.
 
+--for-import writes the smaller set of columns that
+unifi-tools-import-devices.py reads back, so a site can be exported, edited in
+a spreadsheet, and imported again.
+
 Examples:
     python unifi-tools-export-devices.py --host 192.168.1.1
     python unifi-tools-export-devices.py --host 192.168.1.1 --what both
+    python unifi-tools-export-devices.py --host 192.168.1.1 --for-import
 """
 
 import argparse
@@ -17,7 +22,10 @@ import sys
 from datetime import datetime
 
 from _unifi_tools_common import (
+    AP_GROUP_ENDPOINT,
+    DEVICE_COLUMNS,
     LIST_SEPARATOR,
+    UniFiError,
     add_common_args,
     connect,
     export_dir,
@@ -30,6 +38,11 @@ from _unifi_tools_common import (
 
 DEFAULT_WHAT = "devices"  # devices | clients | both
 MAX_CELL_LENGTH = 32000  # Excel cell limit is 32767 chars
+
+# --for-import writes a different shape, so it gets its own folder and filename
+# stem; mixing the two in one folder would leave --max-copies pruning a mix.
+IMPORT_KIND = "devices-import"
+DEFAULT_GROUP_ID = "default"  # attr_hidden_id of the automatic "All APs" group
 
 # Network API endpoints, relative to /api/s/<site>/
 ENDPOINTS = {
@@ -107,6 +120,48 @@ def build_rows(records, kind, uppercase_mac=UPPERCASE_MAC):
     return rows
 
 
+def ap_group_names(groups):
+    """Return {device MAC: [group name]} for the groups a CSV may change."""
+    names = {}
+    for group in groups:
+        if group.get("attr_hidden_id") == DEFAULT_GROUP_ID:
+            continue  # "All APs" holds every AP and is maintained by the console
+        for mac in group.get("device_macs") or []:
+            names.setdefault(mac, []).append(group.get("name", ""))
+    return names
+
+
+def build_import_rows(devices, groups):
+    """Turn device records into the rows unifi-tools-import-devices.py reads."""
+    groups_by_mac = ap_group_names(groups)
+    rows = []
+    for device in devices:
+        mac = device.get("mac", "")
+        config = device.get("config_network") or {}
+        # A device on DHCP keeps whatever ip it was last given statically, so
+        # those columns are only filled in when the setting is actually static.
+        static = config.get("type") == "static"
+        dns = [config.get(field) for field in ("dns1", "dns2")] if static else []
+        rows.append(
+            {
+                "mac": mac,
+                "name": device.get("name") or "",
+                "model": device.get("model") or "",
+                "type": device.get("type") or "",
+                "ip": device.get("ip") or "",
+                "ip_mode": "Static" if static else "DHCP",
+                "static_ip": config.get("ip", "") if static else "",
+                "netmask": config.get("netmask", "") if static else "",
+                "gateway": config.get("gateway", "") if static else "",
+                "dns": LIST_SEPARATOR.join(d for d in dns if d),
+                # Blank, not None, for an AP in no group: both mean the same
+                # thing on the way back in, and blank cannot surprise anyone.
+                "ap_groups": LIST_SEPARATOR.join(sorted(groups_by_mac.get(mac, []))),
+            }
+        )
+    return rows
+
+
 def format_timestamp(value):
     """Convert Unix epoch seconds to DATETIME_FORMAT; blank if missing/invalid."""
     try:
@@ -132,7 +187,42 @@ def parse_args():
         default=UPPERCASE_MAC,
         help="Write MAC addresses in uppercase",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--for-import",
+        action="store_true",
+        help="Write the columns unifi-tools-import-devices.py reads back "
+        "(devices only) instead of the full export",
+    )
+    args = parser.parse_args()
+    if args.for_import and args.what != "devices":
+        parser.error(
+            f"--for-import has nothing to say about clients; drop "
+            f"--what {args.what}"
+        )
+    return args
+
+
+def export_for_import(args, client, timestamp):
+    """Write the import-shaped device CSV; returns an exit code."""
+    devices = client.get(ENDPOINTS["devices"])
+    try:
+        groups = client.get_v2(AP_GROUP_ENDPOINT)
+    except UniFiError as err:
+        print(f"Warning: could not read AP groups: {err}", file=sys.stderr)
+        groups = []
+
+    output_dir = export_dir(args, IMPORT_KIND)
+    stem = export_stem(args.site, IMPORT_KIND)
+    rows = build_import_rows(devices, groups)
+    path = save_export(
+        rows, DEVICE_COLUMNS, output_dir, stem, timestamp, args.max_copies
+    )
+    print(f"Wrote {len(rows)} devices to {path}")
+    print("Edit it, then apply it:")
+    print(f"  python unifi-tools-import-devices.py {path} --host {args.host} --dry-run")
+    if args.open_folder:
+        open_folder(output_dir)
+    return 0
 
 
 def main():
@@ -141,8 +231,11 @@ def main():
     if not client:
         return 1
 
-    kinds = ["devices", "clients"] if args.what == "both" else [args.what]
     timestamp = new_timestamp()
+    if args.for_import:
+        return export_for_import(args, client, timestamp)
+
+    kinds = ["devices", "clients"] if args.what == "both" else [args.what]
     folders = []
     for kind in kinds:
         output_dir = export_dir(args, kind)

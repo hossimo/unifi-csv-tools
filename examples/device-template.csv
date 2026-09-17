@@ -1,0 +1,6 @@
+﻿MAC,Name,Model,Type,IP,IP Mode,Static IP,Netmask,Gateway,DNS,AP Groups
+78:45:58:00:00:01,AP-Lobby,,,,,,,,,
+78:45:58:00:00:02,AP-Warehouse,,,,Static,10.0.10.21,255.255.255.0,10.0.10.1,10.0.10.1; 1.1.1.1,
+78:45:58:00:00:03,,,,,DHCP,,,,,
+78:45:58:00:00:04,AP-Patio,,,,,,,,,Warehouse APs; Outdoor APs
+78:45:58:00:00:05,,,,,,,,,,None

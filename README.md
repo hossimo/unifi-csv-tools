@@ -1,6 +1,6 @@
 # unifi-csv-tools
 
-Export UniFi devices, clients, and WiFi networks from a UniFi OS console to timestamped CSVs, and create or update WiFi networks back from a CSV. Python 3.8+, no dependencies.
+Export UniFi devices, clients, and WiFi networks from a UniFi OS console to timestamped CSVs, and push WiFi networks and device settings back from a CSV. Python 3.8+, no dependencies.
 
 Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 
@@ -12,8 +12,11 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 | [`python unifi-tools-export-wifi.py --host <console>`](#wifi-networks) | Export WiFi networks (SSIDs) to CSV |
 | [`python unifi-tools-import-wifi.py <file.csv> --host <console>`](#importing) | Create WiFi networks from a CSV, or update them with `--update`; add `--dry-run` first |
 | [`python unifi-tools-import-wifi.py --template`](#starting-from-a-template) | Write a starter CSV to fill in; no console needed |
+| [`python unifi-tools-export-devices.py --host <console> --for-import`](#importing-devices) | Export devices in the shape the device import reads back |
+| [`python unifi-tools-import-devices.py <file.csv> --host <console>`](#importing-devices) | Rename devices, set their IP, and set AP groups from a CSV; add `--dry-run` first |
+| [`python unifi-tools-import-devices.py --template`](#importing-devices) | Write a starter device CSV to fill in; no console needed |
 
-All three take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
+They all take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
 
 ## Setup
 
@@ -46,6 +49,7 @@ python unifi-tools-export-devices.py --host 192.168.1.1 --what both --max-copies
 | `--output-dir` | `exports/<type>` | Created if missing |
 | `--max-copies` | `10` | Exports kept per site and type; `0` keeps all |
 | `--uppercase-mac` | off | Write MAC addresses as `AA:BB:CC:DD:EE:FF` |
+| `--for-import` | off | Write the columns `unifi-tools-import-devices.py` reads (devices only) |
 | `--no-open` | off | Don't open the output folder when done |
 | `--verify-ssl` | off | Enable if the console has a trusted certificate |
 
@@ -131,6 +135,36 @@ python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update
 UniFi rejects an SSID if any AP it would broadcast on already has the maximum (4 per radio on many models) with `too many WiFi broadcasts assigned to the device`. Disabled SSIDs count, offline adopted APs count, and a blank `Broadcasting APs` means **all** APs, so only a few "All" SSIDs fill every AP.
 
 To stage more SSIDs before deployment, create one AP group per SSID in UniFi (groups can't be empty, so add any AP, using no AP in more than 4 groups), set `Broadcasting APs` to `Group` and `AP Groups` to that group's name, and import. Move the real APs into the groups when deploying.
+
+## Importing devices
+
+`unifi-tools-import-devices.py` renames adopted devices, switches their management IP between DHCP and static, and sets which AP groups an AP belongs to. Export first, edit the CSV, import it back:
+
+```bash
+python unifi-tools-export-devices.py --host 192.168.1.1 --for-import
+python unifi-tools-import-devices.py exports/devices-import/unifi_default_devices-import_*.csv --host 192.168.1.1 --dry-run
+python unifi-tools-import-devices.py exports/devices-import/unifi_default_devices-import_*.csv --host 192.168.1.1
+```
+
+`--for-import` writes `exports/devices-import/unifi_<site>_devices-import_YYYYMMDD_HHMMSS.csv` with columns `MAC, Name, Model, Type, IP, IP Mode, Static IP, Netmask, Gateway, DNS, AP Groups`. `--template` writes [`examples/device-template.csv`](examples/device-template.csv) instead, if you would rather start from an example — but its MACs are made up, so an export is the better start.
+
+- **Rows are matched by MAC**, the only column that must be filled in. Device names repeat on a site (five APs called `AC Mesh` is normal), so a name is not a key. Any spelling of a MAC works: `aa:bb:...`, `AA-BB-...`, or `aabbccddeeff`.
+- **A blank cell means "leave this alone"**, unlike the WiFi import where a blank cell is a default. A CSV can therefore hold just `MAC` and `Name` and nothing else will be touched.
+- `Model`, `Type`, and `IP` are written by the export for you to read; the import ignores them. `IP` is the address the device is on now, which is not the same as `Static IP`: a device on DHCP keeps a stale `Static IP` in its config from whenever it was last pinned, and the import ignores that too.
+- `IP Mode` is `DHCP` or `Static`. `Static` also needs `Static IP`, `Netmask`, and `Gateway`, and takes one or two `DNS` servers. A gateway outside the address's own subnet is rejected before anything is sent, as is a netmask that isn't one.
+- `AP Groups` is `;` separated group names and replaces whatever groups that AP is in. `None` takes it out of every group, since blank means "leave it". The groups have to exist already — this script doesn't create them — and only APs can be in one. The automatic *All APs* group is maintained by the console and is refused.
+- Devices whose row matches the console are reported as `unchanged` and nothing is sent. Rows with problems are reported and skipped, and the exit code is `1` if any row failed.
+- The run is per row and not atomic: a failure partway through leaves the earlier rows changed. AP group writes happen last, because one group holds many APs.
+
+**Changing `IP Mode` reprovisions the device.** It drops off the network for a moment and comes back at the new address. If the address, netmask, or gateway is wrong, the device is unreachable until it is factory reset — and if you do that to the console you are talking to, the run stops there. Use `--dry-run` first; it prints every change without sending anything.
+
+This script cannot adopt, forget, or restart a device, and a MAC that is not adopted on the site is reported as an error rather than added.
+
+### Why this one uses a different API
+
+The other scripts use the official Network integration API. It can list devices, adopt one, restart one, and forget one — but it cannot rename a device, set its IP, or edit an AP group, so there is nothing there for this script to call. It uses the private API the UniFi UI itself uses instead (`/api/s/<site>/rest/device/<id>` and `/v2/api/site/<site>/apgroups/<id>`), which is undocumented and may change between Network releases. If a Network upgrade breaks it, that is why. The endpoints are named in one place, at the top of `_unifi_tools_common.py`.
+
+The integration API's read-only `device-tags` are the same objects as AP groups, under a different name.
 
 ## Notes
 

@@ -54,6 +54,18 @@ NETWORK_ENDPOINT = "networks"  # For network names and VLAN IDs
 DEVICE_TAG_ENDPOINT = "device-tags"  # AP groups
 DEVICE_ENDPOINT = "devices"  # For AP names
 
+# The two private APIs the UniFi UI itself uses, relative to API_PREFIX. The
+# integration API can only list, adopt, restart, and forget a device, so
+# unifi-tools-import-devices.py renames devices, sets their IP, and edits AP
+# groups through these instead. They are not documented and may change between
+# Network releases; see the Notes section of README.md.
+LEGACY_PREFIX = "/api/s"  # /api/s/<site>/<endpoint>
+V2_PREFIX = "/v2/api/site"  # /v2/api/site/<site>/<endpoint>
+
+DEVICE_LIST_ENDPOINT = "stat/device"  # Legacy; adopted devices with live state
+DEVICE_REST_ENDPOINT = "rest/device"  # Legacy; PUT <id> to change one device
+AP_GROUP_ENDPOINT = "apgroups"  # v2; the integration API's device-tags, writable
+
 # WiFi CSV columns, in order, as row key -> header label.
 WIFI_COLUMNS = {
     "name": "SSID Name",
@@ -68,6 +80,28 @@ WIFI_COLUMNS = {
     "hidden": "Hidden",
     "enabled": "Enabled",
 }
+
+# Device CSV columns, in order, as row key -> header label. Written by
+# unifi-tools-export-devices.py --for-import and read back by
+# unifi-tools-import-devices.py, which matches rows to devices by MAC.
+# Model, Type, and IP are there to read, not to set: the import ignores them.
+DEVICE_COLUMNS = {
+    "mac": "MAC",
+    "name": "Name",
+    "model": "Model",
+    "type": "Type",
+    "ip": "IP",
+    "ip_mode": "IP Mode",
+    "static_ip": "Static IP",
+    "netmask": "Netmask",
+    "gateway": "Gateway",
+    "dns": "DNS",
+    "ap_groups": "AP Groups",
+}
+
+# Columns the import reads but never writes back to the console.
+DEVICE_READ_ONLY_COLUMNS = ("model", "type", "ip")
+
 
 # broadcastingDeviceFilter "type" -> Broadcasting APs label; no filter = All
 DEVICE_FILTER_TYPES = {
@@ -135,7 +169,7 @@ class UniFiClient:
 
     def get(self, endpoint):
         """Return the 'data' list for a site endpoint such as 'stat/device'."""
-        path = f"{API_PREFIX}/api/s/{self.site}/{endpoint}"
+        path = f"{API_PREFIX}{LEGACY_PREFIX}/{self.site}/{endpoint}"
         status, payload = self._request(path)
         self._check_status(path, status)
         if status != 200 or not isinstance(payload, dict):
@@ -219,6 +253,39 @@ class UniFiClient:
     def put_site(self, endpoint, body):
         """PUT to a site-scoped resource, e.g. 'wifi/broadcasts/<id>'."""
         return self.put_integration(f"sites/{self.site_id()}/{endpoint}", body)
+
+    def put_legacy(self, endpoint, body):
+        """PUT to a legacy site endpoint, e.g. 'rest/device/<id>'.
+
+        The legacy API answers 200 with {"meta": {"rc": "error", ...}} as often
+        as it uses a status code, so both are checked.
+        """
+        path = f"{API_PREFIX}{LEGACY_PREFIX}/{self.site}/{endpoint}"
+        status, payload = self._request(path, "PUT", body)
+        self._check_status(path, status)
+        meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        if status != 200 or meta.get("rc") == "error":
+            detail = meta.get("msg") or (json.dumps(payload) if payload else "")
+            raise UniFiError(f"PUT {path} failed: HTTP {status} {detail}".rstrip())
+        return (payload or {}).get("data", [])
+
+    def _v2(self, endpoint, method="GET", body=None):
+        """Send a request to a v2 site endpoint; returns the decoded JSON."""
+        path = f"{API_PREFIX}{V2_PREFIX}/{self.site}/{endpoint}"
+        status, payload = self._request(path, method, body)
+        self._check_status(path, status)
+        if status not in (200, 201):
+            detail = payload.get("message", "") if isinstance(payload, dict) else ""
+            raise UniFiError(f"{method} {path} failed: HTTP {status} {detail}".rstrip())
+        return payload
+
+    def get_v2(self, endpoint):
+        """GET a v2 site endpoint, e.g. 'apgroups'; returns the decoded JSON."""
+        return self._v2(endpoint)
+
+    def put_v2(self, endpoint, body):
+        """PUT to a v2 site resource, e.g. 'apgroups/<id>'."""
+        return self._v2(endpoint, "PUT", body)
 
 
 def load_env_file(path):
