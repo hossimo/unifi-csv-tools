@@ -1,0 +1,7 @@
+- Diff / drift mode. unifi-tools-diff-wifi.py config.csv --host … prints what differs between the CSV and the live site. Falls out almost free once export and import share the row shape, and it's the feature that makes the pair useful for audits.
+- Example CSVs + --template. Ship examples/wifi-template.csv so nobody has to run an export first to learn the shape.
+- Redaction flag. --no-passwords on the WiFi export.
+- Group staging helper. Automate the workaround. --stage creates one device-tag per SSID, assigns a spare AP, imports, and reports what to fix at deploy time.
+- Device import. Rename devices, set static IPs, apply tags from a CSV. this will be a huge time saver!
+- Output formats: --format csv|json|xlsx, or - to stdout for piping.
+- Retry/backoff on 429 and a --verbose / --log-file for scheduled runs.
