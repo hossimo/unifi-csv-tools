@@ -1,0 +1,5 @@
+exports/
+*.csv
+__pycache__/
+.env
+test.*
