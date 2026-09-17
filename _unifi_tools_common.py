@@ -247,15 +247,19 @@ def add_common_args(parser):
     add_output_args(parser)
 
 
-def add_connection_args(parser):
-    """Add the console connection options shared by all scripts."""
+def add_connection_args(parser, host_required=True):
+    """Add the console connection options shared by all scripts.
+
+    host_required=False is for scripts with a mode that talks to no console;
+    they check args.host themselves.
+    """
     parser.epilog = (
         f"The API key is taken from --api-key, else {ENV_API_KEY} "
         "(environment or .env file)."
     )
     parser.add_argument(
         "--host",
-        required=True,
+        required=host_required,
         help="Console address, e.g. 192.168.1.1",
     )
     parser.add_argument(

@@ -1,5 +1,7 @@
 exports/
 *.csv
+# except the checked-in template; real exports hold passwords and stay ignored
+!examples/wifi-template.csv
 __pycache__/
 .env
 test.*

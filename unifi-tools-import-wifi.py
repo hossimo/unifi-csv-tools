@@ -9,11 +9,15 @@ skipped unless --update is given, which changes them to match the CSV instead;
 SSIDs are matched by name, so --update cannot rename one. Settings the CSV does
 not cover keep their current values. Standard library only, Python 3.8+.
 
+--template writes a starter CSV with an example of each pattern, so there is no
+need to run an export first; it is the checked-in examples/wifi-template.csv.
+
 Only "SSID Name" is required. Blank cells fall back to defaults:
     Password          blank = open network
     Network / VLAN    blank = the default network
     Broadcasting APs  blank = All
-    Security          blank = WPA2_PERSONAL (OPEN when there is no password)
+    Security          blank = WPA2_PERSONAL (OPEN when there is no password);
+                      OPEN, WPA2_PERSONAL, WPA3_PERSONAL, WPA2_WPA3_PERSONAL
     Band              blank = 2.4 GHz; 5 GHz
     Hidden / Enabled  blank = No / Yes
 
@@ -21,11 +25,13 @@ Examples:
     python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --dry-run
     python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1
     python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update
+    python unifi-tools-import-wifi.py --template
 """
 
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from _unifi_tools_common import (
     DEVICE_ENDPOINT,
@@ -40,18 +46,96 @@ from _unifi_tools_common import (
     connect,
     read_csv,
     run,
+    write_csv,
 )
+
+# Starter rows for --template, also checked in as examples/wifi-template.csv.
+# Columns left out are written blank, which is how the defaults are shown.
+TEMPLATE_FILE = "wifi-template.csv"
+TEMPLATE_ROWS = [
+    # The minimum: a name and a password. Everything else takes its default,
+    # so this is a WPA2 network on the default network, on 2.4 and 5 GHz.
+    {"name": "Office", "password": "ChangeMe123"},
+    # A VLAN network chosen by name, on one band
+    {
+        "name": "Office-IoT",
+        "password": "ChangeMe456",
+        "network": "IoT",
+        "broadcasting_aps": "All",
+        "security": "WPA2_PERSONAL",
+        "band": "2.4 GHz",
+        "hidden": "No",
+        "enabled": "Yes",
+    },
+    # The same by VLAN ID instead of name, broadcast from one AP group
+    {
+        "name": "Warehouse",
+        "password": "ChangeMe789",
+        "vlan": "30",
+        "broadcasting_aps": "Group",
+        "ap_groups": "Warehouse APs",
+        "band": "2.4 GHz; 5 GHz",
+    },
+    # Named APs, hidden and turned off: the staging pattern described in README
+    {
+        "name": "Lab-Staging",
+        "password": "ChangeMe321",
+        "network": "Lab",
+        "broadcasting_aps": "Specific",
+        "aps": "AP-Lab-1; AP-Lab-2",
+        "band": "5 GHz",
+        "hidden": "Yes",
+        "enabled": "No",
+    },
+    # No password, so an open network; Security must say so
+    {
+        "name": "Guest-Open",
+        "network": "Guest",
+        "broadcasting_aps": "All",
+        "security": "OPEN",
+        "enabled": "Yes",
+    },
+    # WPA3 on the newer bands
+    {
+        "name": "Modern",
+        "password": "ChangeMe654",
+        "security": "WPA3_PERSONAL",
+        "band": "5 GHz; 6 GHz",
+    },
+]
 
 DEFAULT_SECURITY = "WPA2_PERSONAL"
 OPEN_SECURITY = "OPEN"
 DEFAULT_BANDS = [2.4, 5]
 ALLOWED_BANDS = (2.4, 5, 6)  # GHz, per the API schema
 PASSPHRASE_LENGTH = (8, 63)  # WPA personal limits
-FAST_ROAMING = False  # 802.11r; the API requires this setting for WPA security
+FAST_ROAMING = False  # 802.11r
+SAE_CONFIGURATION = {"anticloggingThresholdSeconds": 5, "syncTimeSeconds": 5}  # 1-60
+PMF_MODE = "OPTIONAL"  # Protected Management Frames: REQUIRED or OPTIONAL
 
-# Security settings a new SSID needs that the CSV does not cover. As with
-# WIFI_DEFAULTS, --update keeps whatever an existing SSID is set to.
-SECURITY_DEFAULTS = {"fastRoamingEnabled": FAST_ROAMING}
+# What each security type needs beyond the CSV's Password. The API rejects an
+# SSID that leaves any of it out, so these are sent with every new SSID; as with
+# WIFI_DEFAULTS, --update keeps whatever an existing SSID is set to. Values
+# match the UniFi UI. Security types missing here are rejected before any
+# request is sent, so the CSV cannot produce a body the API will refuse.
+SECURITY_DEFAULTS = {
+    OPEN_SECURITY: {},
+    "WPA2_PERSONAL": {"fastRoamingEnabled": FAST_ROAMING},
+    "WPA3_PERSONAL": {
+        "fastRoamingEnabled": FAST_ROAMING,
+        "saeConfiguration": SAE_CONFIGURATION,
+    },
+    "WPA2_WPA3_PERSONAL": {
+        "fastRoamingEnabled": FAST_ROAMING,
+        "wpa3FastRoamingEnabled": FAST_ROAMING,
+        "pmfMode": PMF_MODE,
+        "saeConfiguration": SAE_CONFIGURATION,
+    },
+}
+
+# The API also has WPA2/WPA3 Enterprise, which need a RADIUS profile that this
+# CSV has no column for. They are named so the error can say why.
+ENTERPRISE_SECURITY = ("WPA2_ENTERPRISE", "WPA3_ENTERPRISE", "WPA2_WPA3_ENTERPRISE")
 
 # Settings sent with every new SSID that the CSV does not cover. All but
 # bandSteeringEnabled are required by the API. Values match an SSID created in
@@ -181,6 +265,16 @@ def build_fields(row, networks, device_tags, devices):
     security = row["security"].upper() or (
         DEFAULT_SECURITY if password else OPEN_SECURITY
     )
+    if security in ENTERPRISE_SECURITY:
+        raise RowError(
+            f"Security {security} needs a RADIUS profile, which this CSV cannot "
+            f"describe; create the SSID in UniFi instead"
+        )
+    if security not in SECURITY_DEFAULTS:
+        raise RowError(
+            f"Security '{row['security']}' is not one of "
+            f"{', '.join(SECURITY_DEFAULTS)}"
+        )
     if security == OPEN_SECURITY:
         if password:
             raise RowError("Security is OPEN but a Password is set")
@@ -219,12 +313,14 @@ def build_fields(row, networks, device_tags, devices):
 
 def full_security(security, current=None):
     """Security settings to send: the CSV's over the current ones, else defaults."""
-    if security.get("type") == OPEN_SECURITY:
-        return security
-    # Keep what the CSV does not cover (PMF mode, fast roaming, SAE) when the
-    # SSID already uses this security type; fall back to the defaults when not.
-    base = current if current and current.get("type") == security.get("type") else None
-    return {**(base or SECURITY_DEFAULTS), **security}
+    # Keep what the CSV does not cover (PMF mode, fast roaming, SAE, open
+    # network encryption) when the SSID already uses this security type;
+    # fall back to what the type needs when it does not.
+    if current and current.get("type") == security.get("type"):
+        base = current
+    else:
+        base = SECURITY_DEFAULTS.get(security.get("type"), {})
+    return {**base, **security}
 
 
 def apply_api_rules(body):
@@ -291,12 +387,40 @@ def redacted(body):
     return copy
 
 
+def write_template(path):
+    """Write the starter CSV to path; returns an exit code."""
+    path = Path(path)
+    if path.exists():
+        print(
+            f"Error: {path} already exists. Delete it or give another path.",
+            file=sys.stderr,
+        )
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        write_csv(TEMPLATE_ROWS, path, WIFI_COLUMNS)
+    except OSError as err:
+        raise UniFiError(f"Cannot write {path}: {err}") from err
+    print(f"Wrote {path} with {len(TEMPLATE_ROWS)} example rows.")
+    print("Edit it to match your site, then import it:")
+    print(f"  python {Path(sys.argv[0]).name} {path} --host <console> --dry-run")
+    return 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Create or update UniFi WiFi networks from a CSV (as written by unifi-tools-export-wifi.py)."
     )
-    parser.add_argument("csv", help="CSV file to import")
-    add_connection_args(parser)
+    parser.add_argument("csv", nargs="?", help="CSV file to import")
+    add_connection_args(parser, host_required=False)
+    parser.add_argument(
+        "--template",
+        nargs="?",
+        const=TEMPLATE_FILE,
+        metavar="PATH",
+        help=f"Write a starter CSV to PATH (default: {TEMPLATE_FILE}) and exit; "
+        "needs no console",
+    )
     parser.add_argument(
         "--update",
         action="store_true",
@@ -307,11 +431,24 @@ def parse_args():
         action="store_true",
         help="Show the requests that would be sent without changing anything",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.template and args.csv:
+        parser.error(
+            f"--template writes {args.template} and reads no csv; "
+            f"drop '{args.csv}' or the option"
+        )
+    if not args.template:
+        if not args.csv:
+            parser.error("the csv argument is required (or use --template)")
+        if not args.host:
+            parser.error("--host is required")
+    return args
 
 
 def main():
     args = parse_args()
+    if args.template:
+        return write_template(args.template)
     try:
         rows, missing = read_csv(args.csv, WIFI_COLUMNS)
     except OSError as err:

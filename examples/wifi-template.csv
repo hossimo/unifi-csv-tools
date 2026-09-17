@@ -1,0 +1,7 @@
+﻿SSID Name,Password,Network,VLAN,Broadcasting APs,AP Groups,APs,Security,Band,Hidden,Enabled
+Office,ChangeMe123,,,,,,,,,
+Office-IoT,ChangeMe456,IoT,,All,,,WPA2_PERSONAL,2.4 GHz,No,Yes
+Warehouse,ChangeMe789,,30,Group,Warehouse APs,,,2.4 GHz; 5 GHz,,
+Lab-Staging,ChangeMe321,Lab,,Specific,,AP-Lab-1; AP-Lab-2,,5 GHz,Yes,No
+Guest-Open,,Guest,,All,,,OPEN,,,Yes
+Modern,ChangeMe654,,,,,,WPA3_PERSONAL,5 GHz; 6 GHz,,

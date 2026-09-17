@@ -11,8 +11,9 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 | [`python unifi-tools-export-devices.py --host <console>`](#devices-and-clients) | Export devices (and clients with `--what both`) to CSV |
 | [`python unifi-tools-export-wifi.py --host <console>`](#wifi-networks) | Export WiFi networks (SSIDs) to CSV |
 | [`python unifi-tools-import-wifi.py <file.csv> --host <console>`](#importing) | Create WiFi networks from a CSV, or update them with `--update`; add `--dry-run` first |
+| [`python unifi-tools-import-wifi.py --template`](#starting-from-a-template) | Write a starter CSV to fill in; no console needed |
 
-All three take `--host` (required), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
+All three take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
 
 ## Setup
 
@@ -80,6 +81,19 @@ Output: `exports/wifi/unifi_<site>_wifi_YYYYMMDD_HHMMSS.csv`, with columns `SSID
 - `Security` is the API's type, e.g. `WPA2_PERSONAL` or `OPEN`.
 - **Passwords are written in plain text.** The `--raw` JSON also contains them. `exports/` is git-ignored, but treat these files as secrets.
 
+### Starting from a template
+
+You don't need to run an export first to learn the format. [`examples/wifi-template.csv`](examples/wifi-template.csv) is a filled-in starter, and `--template` writes a fresh copy wherever you want one:
+
+```bash
+python unifi-tools-import-wifi.py --template                 # writes wifi-template.csv here
+python unifi-tools-import-wifi.py --template sites/acme.csv  # or to a path you choose
+```
+
+It has one row per pattern: the minimum of just a name and a password, a network by name, a network by VLAN ID, an AP group, named APs, an open network, and WPA3 on 5 and 6 GHz. Blank cells are the defaults listed below, so the first row is a plain WPA2 SSID on the default network.
+
+Replace the rows with your own before importing. The example networks and AP groups (`IoT`, `Warehouse APs`, `AP-Lab-1`) are placeholders and will not exist on your site; a row naming something that isn't there is reported and skipped. `--template` never overwrites an existing file.
+
 ### Importing
 
 `unifi-tools-import-wifi.py` creates SSIDs from a CSV in the same format. It takes the connection options (`--host`, `--api-key`, `--port`, `--site`, `--verify-ssl`) plus `--update` (below) and `--dry-run`, which prints each request (password hidden) without changing anything.
@@ -96,7 +110,8 @@ python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --update
 - Only `SSID Name` is required. SSIDs whose name already exists are skipped, unless `--update` is given.
 - Blank cells use defaults: no password = open network, no `Network`/`VLAN` = the default network, `Broadcasting APs` = All, `Security` = `WPA2_PERSONAL`, `Band` = 2.4 and 5 GHz, `Hidden` = No, `Enabled` = Yes.
 - `Network` is matched by name, or by `VLAN` if the name is blank. `AP Groups` and `APs` are names separated by `;` and must match exactly one group or AP.
-- New SSIDs take their other settings (band steering, client isolation, etc.) from `WIFI_DEFAULTS` in `unifi-tools-import-wifi.py`, and 802.11r fast roaming from `SECURITY_DEFAULTS`.
+- `Security` is `OPEN`, `WPA2_PERSONAL`, `WPA3_PERSONAL`, or `WPA2_WPA3_PERSONAL`. The API's WPA2/WPA3 Enterprise types need a RADIUS profile that this CSV has no column for, so those rows are rejected with a note to create the SSID in UniFi; `Band` is any of 2.4, 5, and 6 GHz.
+- New SSIDs take their other settings (band steering, client isolation, etc.) from `WIFI_DEFAULTS` in `unifi-tools-import-wifi.py`. `SECURITY_DEFAULTS` holds what each security type needs beyond the password and the API will not accept without: fast roaming, and for WPA3 the SAE timers and PMF mode.
 - Band steering is dropped from the request when `Band` lists one frequency; the API rejects the setting outright on a single band.
 - Rows with problems are reported and skipped; the exit code is `1` if any row failed.
 
@@ -120,3 +135,4 @@ To stage more SSIDs before deployment, create one AP group per SSID in UniFi (gr
 ## Notes
 
 - `clients` covers currently connected clients only.
+- The console serves the integration API's OpenAPI spec at `https://<console>/proxy/network/api-docs/integration.json` (the same API key works). It is the reference for the request bodies these scripts build, and the browsable version is under Control Plane > UniFi API.
