@@ -64,6 +64,7 @@ V2_PREFIX = "/v2/api/site"  # /v2/api/site/<site>/<endpoint>
 
 DEVICE_LIST_ENDPOINT = "stat/device"  # Legacy; adopted devices with live state
 DEVICE_REST_ENDPOINT = "rest/device"  # Legacy; PUT <id> to change one device
+SETTING_ENDPOINT = "get/setting"  # Legacy; site settings, including the country
 AP_GROUP_ENDPOINT = "apgroups"  # v2; the integration API's device-tags, writable
 
 # WiFi CSV columns, in order, as row key -> header label.
@@ -111,7 +112,15 @@ DEVICE_FILTER_TYPES = {
 
 
 class UniFiError(Exception):
-    """Raised for connection, authentication, or API failures."""
+    """Raised for connection, authentication, or API failures.
+
+    code carries the console's own api.err.* string when it sent one, so a
+    caller can explain a failure without parsing the message back apart.
+    """
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 class UniFiClient:
@@ -125,6 +134,7 @@ class UniFiClient:
         self.timeout = timeout
         self.headers = {"Accept": "application/json", "X-API-KEY": api_key}
         self._site_id = None
+        self._country = None
 
         ctx = ssl.create_default_context()
         if not verify_ssl:
@@ -266,7 +276,10 @@ class UniFiClient:
         meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
         if status != 200 or meta.get("rc") == "error":
             detail = meta.get("msg") or (json.dumps(payload) if payload else "")
-            raise UniFiError(f"PUT {path} failed: HTTP {status} {detail}".rstrip())
+            raise UniFiError(
+                f"PUT {path} failed: HTTP {status} {detail}".rstrip(),
+                code=meta.get("msg"),
+            )
         return (payload or {}).get("data", [])
 
     def _v2(self, endpoint, method="GET", body=None):
@@ -286,6 +299,157 @@ class UniFiClient:
     def put_v2(self, endpoint, body):
         """PUT to a v2 site resource, e.g. 'apgroups/<id>'."""
         return self._v2(endpoint, "PUT", body)
+
+    def site_country(self):
+        """Return the site's configured country code, or None. Cached.
+
+        Only ever used to make an error message clearer, so a console that
+        will not hand over its settings costs nothing but a vaguer message.
+        """
+        if self._country is None:
+            self._country = ""  # Cache the miss too, so one failure is enough
+            try:
+                for setting in self.get(SETTING_ENDPOINT):
+                    if setting.get("key") == "country":
+                        self._country = str(setting.get("code") or "")
+                        break
+            except UniFiError:
+                pass
+        return self._country or None
+
+
+# ---------------------------------------------------------------------------
+# Device configuration checks
+# ---------------------------------------------------------------------------
+# The console re-validates a device's entire stored document on every write to
+# rest/device, so a device whose saved config has drifted out of bounds refuses
+# every change made to it, a rename included, with an error about the setting
+# that is wrong rather than the one being set. check_device() finds those
+# devices by asking the console, which is the only answer that stays correct:
+# the channel and regulatory rules live in the Network application and change
+# with it, so a copy of them here would be wrong the day a release moved one.
+
+# api.err.* codes worth explaining, as code -> what it actually means.
+API_ERROR_HINTS = {
+    "api.err.InvalidChannel": (
+        "the saved radio settings are not valid for this device's country and "
+        "outdoor mode. Set a legal channel and width in UniFi (or set the "
+        "channel to Auto), then retry"
+    ),
+    "api.err.InvalidPayload": (
+        "the console rejected the shape of the request, which usually means "
+        "this Network release changed the endpoint"
+    ),
+    "api.err.IdInvalid": (
+        "the console has no device with this id, so it was probably forgotten "
+        "or re-adopted since the CSV was exported"
+    ),
+}
+
+# Codes that say nothing about the device's own settings, so listing its radios
+# under them is noise. Anything not named here gets the settings printed: an
+# unrecognised code is exactly when the extra context is worth having.
+CODES_WITHOUT_RADIO_CONTEXT = frozenset(
+    {"api.err.IdInvalid", "api.err.InvalidPayload"}
+)
+
+# radio_table "radio" values -> the band a person would call it
+RADIO_BANDS = {"ng": "2.4 GHz", "na": "5 GHz", "6e": "6 GHz", "ad": "60 GHz"}
+
+
+def error_hint(code):
+    """Return a plain-language cause for an api.err.* code, or None."""
+    return API_ERROR_HINTS.get(code)
+
+
+def device_check_body(device):
+    """Return a body that changes nothing but still makes the console validate.
+
+    The name is controller-side metadata that is never pushed to the hardware,
+    so writing back the value a device already has leaves an empty delta: the
+    console runs its full document validation and then skips the provision.
+    Verified against 10.6.106 - cfgversion, known_cfgversion, provisioned_at,
+    state, and connected_at were all unchanged afterwards. A device with no
+    name and one with an empty name are the same thing to UniFi, so "" is a
+    no-op on an unnamed device too.
+    """
+    return {"name": device.get("name") or ""}
+
+
+def check_device(client, device):
+    """Ask the console whether a device's saved config is still valid.
+
+    Returns None when the console accepts a no-op write to the device, or the
+    api.err.* code it refused with. Nothing about the device changes either way.
+    """
+    if not device.get("_id"):
+        return "api.err.IdInvalid"
+    try:
+        client.put_legacy(
+            f"{DEVICE_REST_ENDPOINT}/{device['_id']}", device_check_body(device)
+        )
+    except UniFiError as err:
+        return err.code or str(err)
+    return None
+
+
+def describe_device_config(device, site_country=None):
+    """The settings a regulatory rejection turns on, as lines for an error message."""
+    details = []
+    for radio in device.get("radio_table") or []:
+        band = RADIO_BANDS.get(radio.get("radio")) or radio.get("radio") or "?"
+        details.append(
+            f"{band} ({radio.get('name', '?')}): channel "
+            f"{radio.get('channel', '?')} at {radio.get('ht', '?')} MHz"
+        )
+    outdoor = device.get("outdoor_mode_override")
+    if outdoor and outdoor != "default":
+        details.append(f"outdoor mode: {outdoor}")
+    country = device.get("country_code")
+    if country is not None:
+        note = f"country: device says {country}"
+        # A device and its site disagreeing is not an error on its own, but it
+        # decides which channels are legal, so it belongs in the message.
+        if site_country and str(site_country) != str(country):
+            note += f", site says {site_country}"
+        details.append(note)
+    return details
+
+
+def report_device_error(
+    label, code, device, site_country=None, stream=sys.stderr, message=None
+):
+    """Print an api.err.* failure together with the settings it points at.
+
+    message overrides what is shown on the first line, for a caller holding a
+    fuller error than the bare code.
+    """
+    print(f"{label}: error, {message if message is not None else code}", file=stream)
+    hint = error_hint(code)
+    if hint:
+        print(f"  {hint}", file=stream)
+    if code not in CODES_WITHOUT_RADIO_CONTEXT:
+        for detail in describe_device_config(device, site_country):
+            print(f"  {detail}", file=stream)
+
+
+def check_devices(client, devices, stream=sys.stderr):
+    """Check every device and report the ones the console would refuse.
+
+    Returns the list of (device, code) that failed.
+    """
+    country = client.site_country()
+    failures = []
+    for device in devices:
+        code = check_device(client, device)
+        if not code:
+            continue
+        failures.append((device, code))
+        label = device.get("name") or device.get("model") or "device"
+        report_device_error(
+            f"Check: {label} ({device.get('mac')})", code, device, country, stream
+        )
+    return failures
 
 
 def load_env_file(path):

@@ -27,12 +27,20 @@ Changing IP Mode reprovisions the device, which drops it off the network for a
 moment and brings it back at the new address. Get it wrong and the device is
 unreachable until it is factory reset, so run --dry-run first.
 
+The console re-validates a device's whole stored config on every write, so a
+device whose saved settings have gone out of bounds refuses every change made
+to it and names the setting that is wrong rather than the one being set - a
+rename rejected for api.err.InvalidChannel, say. Those failures are reported
+with the radio settings, outdoor mode, and country they point at, and --check
+finds them ahead of time.
+
 --template writes a starter CSV with an example of each pattern; it is the
 checked-in examples/device-template.csv. Standard library only, Python 3.8+.
 
 Examples:
     python unifi-tools-import-devices.py devices.csv --host 192.168.1.1 --dry-run
     python unifi-tools-import-devices.py devices.csv --host 192.168.1.1
+    python unifi-tools-import-devices.py devices.csv --host 192.168.1.1 --check
     python unifi-tools-import-devices.py --template
 """
 
@@ -50,8 +58,10 @@ from _unifi_tools_common import (
     LIST_SEPARATOR,
     UniFiError,
     add_connection_args,
+    check_device,
     connect,
     read_csv,
+    report_device_error,
     run,
     write_csv,
 )
@@ -336,6 +346,14 @@ def parse_args():
         "needs no console",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Before changing a device, ask the console whether its saved "
+        "settings are still valid, and skip it if they are not. Sends one "
+        "no-op write per device, which changes nothing; it runs under "
+        "--dry-run too, since that is where it is most useful",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would change without changing anything",
@@ -404,6 +422,14 @@ def main():
 
         name = device.get("name") or device.get("model") or ""
         label = f"{label} '{name}'" if name else label
+        # Ask first, so a device that refuses every write is reported against
+        # the setting that is actually wrong instead of the one being set.
+        if args.check:
+            code = check_device(client, device)
+            if code:
+                report_device_error(label, code, device, client.site_country())
+                failed += 1
+                continue
         try:
             changes = build_changes(row, device)
             wanted = parse_ap_groups(row, device, groups)
@@ -443,7 +469,9 @@ def main():
             try:
                 client.put_legacy(f"{DEVICE_REST_ENDPOINT}/{device['_id']}", changes)
             except UniFiError as err:
-                print(f"{label}: error, {err}", file=sys.stderr)
+                report_device_error(
+                    label, err.code, device, client.site_country(), message=err
+                )
                 failed += 1
                 wanted_by_mac.pop(mac, None)
                 continue

@@ -14,6 +14,7 @@ Examples:
     python unifi-tools-export-devices.py --host 192.168.1.1
     python unifi-tools-export-devices.py --host 192.168.1.1 --what both
     python unifi-tools-export-devices.py --host 192.168.1.1 --for-import
+    python unifi-tools-export-devices.py --host 192.168.1.1 --check
 """
 
 import argparse
@@ -27,6 +28,7 @@ from _unifi_tools_common import (
     LIST_SEPARATOR,
     UniFiError,
     add_common_args,
+    check_devices,
     connect,
     export_dir,
     export_stem,
@@ -188,6 +190,13 @@ def parse_args():
         help="Write MAC addresses in uppercase",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Also ask the console whether each device's saved settings are "
+        "still valid, and exit non-zero if any are not. Sends one no-op write "
+        "per device, which changes nothing and does not reprovision anything",
+    )
+    parser.add_argument(
         "--for-import",
         action="store_true",
         help="Write the columns unifi-tools-import-devices.py reads back "
@@ -199,7 +208,31 @@ def parse_args():
             f"--for-import has nothing to say about clients; drop "
             f"--what {args.what}"
         )
+    if args.check and args.what == "clients":
+        parser.error("--check reads device settings; drop --what clients")
     return args
+
+
+def run_check(client, devices):
+    """Report the devices the console would refuse to save; returns the failures.
+
+    A device is checked by writing its own name back to it. That leaves an
+    empty delta, so nothing about the device changes, but the console still
+    validates the whole stored document on the way through and says so when
+    something in it has gone out of bounds.
+    """
+    print(f"Checking {len(devices)} devices...")
+    failures = check_devices(client, devices)
+    if failures:
+        print(
+            f"Check: {len(failures)} of {len(devices)} devices cannot be saved "
+            f"as they are. Until each is fixed in UniFi, importing any change "
+            f"to it will fail.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Check: all {len(devices)} devices are in a saveable state.")
+    return failures
 
 
 def export_for_import(args, client, timestamp):
@@ -220,9 +253,10 @@ def export_for_import(args, client, timestamp):
     print(f"Wrote {len(rows)} devices to {path}")
     print("Edit it, then apply it:")
     print(f"  python unifi-tools-import-devices.py {path} --host {args.host} --dry-run")
+    failures = run_check(client, devices) if args.check else []
     if args.open_folder:
         open_folder(output_dir)
-    return 0
+    return 1 if failures else 0
 
 
 def main():
@@ -237,19 +271,24 @@ def main():
 
     kinds = ["devices", "clients"] if args.what == "both" else [args.what]
     folders = []
+    failures = []
     for kind in kinds:
         output_dir = export_dir(args, kind)
         folders.append(output_dir)
-        rows = build_rows(client.get(ENDPOINTS[kind]), kind, args.uppercase_mac)
+        records = client.get(ENDPOINTS[kind])
+        rows = build_rows(records, kind, args.uppercase_mac)
         stem = export_stem(args.site, kind)
         path = save_export(
             rows, EXPORT_COLUMNS, output_dir, stem, timestamp, args.max_copies
         )
         print(f"Wrote {len(rows)} {kind} to {path}")
+        # After the write, so a refused device never costs anyone the export
+        if args.check and kind == "devices":
+            failures = run_check(client, records)
     if args.open_folder:
         # One folder per type; with --what both open their shared parent
         open_folder(folders[0] if len(set(folders)) == 1 else folders[0].parent)
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

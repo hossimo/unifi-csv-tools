@@ -14,6 +14,7 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 | [`python unifi-tools-import-wifi.py --template`](#starting-from-a-template) | Write a starter CSV to fill in; no console needed |
 | [`python unifi-tools-export-devices.py --host <console> --for-import`](#importing-devices) | Export devices in the shape the device import reads back |
 | [`python unifi-tools-import-devices.py <file.csv> --host <console>`](#importing-devices) | Rename devices, set their IP, and set AP groups from a CSV; add `--dry-run` first |
+| [`python unifi-tools-export-devices.py --host <console> --check`](#checking-for-settings-the-console-refuses) | Report devices whose saved settings the console would refuse to save |
 | [`python unifi-tools-import-devices.py --template`](#importing-devices) | Write a starter device CSV to fill in; no console needed |
 
 They all take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
@@ -50,6 +51,7 @@ python unifi-tools-export-devices.py --host 192.168.1.1 --what both --max-copies
 | `--max-copies` | `10` | Exports kept per site and type; `0` keeps all |
 | `--uppercase-mac` | off | Write MAC addresses as `AA:BB:CC:DD:EE:FF` |
 | `--for-import` | off | Write the columns `unifi-tools-import-devices.py` reads (devices only) |
+| `--check` | off | Also report devices whose saved settings the console would refuse; see [Checking for settings the console refuses](#checking-for-settings-the-console-refuses) |
 | `--no-open` | off | Don't open the output folder when done |
 | `--verify-ssl` | off | Enable if the console has a trusted certificate |
 
@@ -159,6 +161,41 @@ python unifi-tools-import-devices.py exports/devices-import/unifi_default_device
 **Changing `IP Mode` reprovisions the device.** It drops off the network for a moment and comes back at the new address. If the address, netmask, or gateway is wrong, the device is unreachable until it is factory reset — and if you do that to the console you are talking to, the run stops there. Use `--dry-run` first; it prints every change without sending anything.
 
 This script cannot adopt, forget, or restart a device, and a MAC that is not adopted on the site is reported as an error rather than added.
+
+### Checking for settings the console refuses
+
+The console re-validates a device's **whole stored config** on every write, not just the part being changed. So a device whose saved settings have drifted out of bounds refuses *every* change made to it, and complains about the setting that is wrong rather than the one you set:
+
+```
+Line 2 78:45:58:00:00:04 'patio': changing (name 'patio' -> 'AP-Patio')
+Line 2 78:45:58:00:00:04 'patio': error, PUT ... failed: HTTP 400 api.err.InvalidChannel
+```
+
+That rename was refused because the AP had outdoor mode on and its 5 GHz radio pinned to channel 40, which is not allowed outdoors in that regulatory domain. The name was never the problem. Failures like this now print the settings the console is pointing at:
+
+```
+  the saved radio settings are not valid for this device's country and outdoor mode.
+  Set a legal channel and width in UniFi (or set the channel to Auto), then retry
+  2.4 GHz (wifi0): channel 11 at 20 MHz
+  5 GHz (wifi1): channel 40 at 80 MHz
+  outdoor mode: on
+  country: device says 840, site says 124
+```
+
+`--check` finds those devices before they cost you a run. It works on either script:
+
+```bash
+# Audit every device on the site
+python unifi-tools-export-devices.py --host 192.168.1.1 --check
+
+# Check only the devices a CSV names, and skip any the console would refuse
+python unifi-tools-import-devices.py devices.csv --host 192.168.1.1 --check --dry-run
+```
+
+- **It asks the console rather than judging for itself.** Channel and regulatory rules live in the Network application and change with it, so a copy of them here would be wrong the day a release moved one.
+- **It changes nothing.** Each device is checked by writing its own name back to it. The name is controller-side metadata that never reaches the hardware, so the console validates the whole document and then finds an empty delta and skips the provision. Verified against 10.6.106: `cfgversion`, `known_cfgversion`, `provisioned_at`, `state`, and `connected_at` were all unchanged afterwards.
+- It runs under `--dry-run` too, which is where it is most useful — but note that it is the one thing `--dry-run` still sends.
+- On the export the CSV is written first, so a refused device never costs you the export. Either script exits `1` if any device fails.
 
 ### Why this one uses a different API
 
