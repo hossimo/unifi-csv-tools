@@ -10,9 +10,12 @@ Standard library only, Python 3.8+.
 import csv
 import json
 import os
+import re
+import shutil
 import ssl
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +32,12 @@ DEFAULT_MAX_COPIES = 10  # 0 = keep every export
 VERIFY_SSL = False  # Consoles ship with self-signed certs
 OPEN_FOLDER = True  # Open the output folder in Explorer/Finder when done
 REQUEST_TIMEOUT = 30  # Seconds
+
+# Consoles rate limit the Protect API at ten requests a second and answer a 429
+# with Retry-After: 1, so a 429 is a pause rather than a failure. An export that
+# walks a dozen endpoints trips it without this.
+RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_MAX_WAIT = 30  # Seconds; a longer Retry-After is not waited out
 
 FILE_PREFIX = "unifi"
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"  # Must sort chronologically
@@ -66,6 +75,13 @@ DEVICE_LIST_ENDPOINT = "stat/device"  # Legacy; adopted devices with live state
 DEVICE_REST_ENDPOINT = "rest/device"  # Legacy; PUT <id> to change one device
 SETTING_ENDPOINT = "get/setting"  # Legacy; site settings, including the country
 AP_GROUP_ENDPOINT = "apgroups"  # v2; the integration API's device-tags, writable
+
+# UniFi Protect's own integration API, a separate application behind the same
+# console. Unlike the Network one, Protect's private API refuses an API key
+# outright (401), so this is the only way in and the export is limited to what
+# it exposes - no firmware version, IP address, or recording settings.
+PROTECT_PREFIX = "/proxy/protect"
+PROTECT_INTEGRATION_PREFIX = "/integration/v1"
 
 # WiFi CSV columns, in order, as row key -> header label.
 WIFI_COLUMNS = {
@@ -111,6 +127,15 @@ DEVICE_FILTER_TYPES = {
 }
 
 
+def retry_after(headers, attempt):
+    """Seconds to wait before retrying a 429, from Retry-After or our own backoff."""
+    try:
+        wait = int(headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        wait = 2**attempt
+    return max(1, min(wait, RATE_LIMIT_MAX_WAIT))
+
+
 class UniFiError(Exception):
     """Raised for connection, authentication, or API failures.
 
@@ -145,22 +170,32 @@ class UniFiClient:
         )
 
     def _request(self, path, method="GET", body=None):
-        """Send a request with an optional JSON body; returns (status, JSON or None)."""
+        """Send a request with an optional JSON body; returns (status, JSON or None).
+
+        A 429 is waited out and retried. Every request these scripts send is
+        idempotent - a GET, or a PUT of the settings wanted - so a retry can
+        only repeat the same outcome.
+        """
         headers = dict(self.headers)
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(
-            self.base_url + path, data=data, headers=headers, method=method
-        )
-        try:
-            with self.opener.open(req, timeout=self.timeout) as resp:
-                status, raw = resp.status, resp.read()
-        except urllib.error.HTTPError as err:
-            status, raw = err.code, err.read()
-        except (urllib.error.URLError, OSError) as err:
-            raise UniFiError(f"Cannot reach {self.base_url}: {err}") from err
+
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            req = urllib.request.Request(
+                self.base_url + path, data=data, headers=headers, method=method
+            )
+            try:
+                with self.opener.open(req, timeout=self.timeout) as resp:
+                    status, raw, head = resp.status, resp.read(), resp.headers
+            except urllib.error.HTTPError as err:
+                status, raw, head = err.code, err.read(), err.headers
+            except (urllib.error.URLError, OSError) as err:
+                raise UniFiError(f"Cannot reach {self.base_url}: {err}") from err
+            if status != 429 or attempt == RATE_LIMIT_RETRIES:
+                break
+            time.sleep(retry_after(head, attempt))
 
         try:
             payload = json.loads(raw) if raw else None
@@ -175,7 +210,10 @@ class UniFiClient:
                 f"Not authorized for {path} (HTTP {status}). Check the API key."
             )
         if status == 429:
-            raise UniFiError("Rate limited by the console, wait and retry.")
+            raise UniFiError(
+                f"Still rate limited after {RATE_LIMIT_RETRIES} retries; "
+                f"wait a moment and run it again."
+            )
 
     def get(self, endpoint):
         """Return the 'data' list for a site endpoint such as 'stat/device'."""
@@ -299,6 +337,31 @@ class UniFiClient:
     def put_v2(self, endpoint, body):
         """PUT to a v2 site resource, e.g. 'apgroups/<id>'."""
         return self._v2(endpoint, "PUT", body)
+
+    def get_protect(self, endpoint):
+        """GET a Protect integration API path such as 'cameras'; returns the JSON.
+
+        Protect grants API access separately from Network, so a key that reads
+        the Network side happily can still be refused here.
+        """
+        path = f"{PROTECT_PREFIX}{PROTECT_INTEGRATION_PREFIX}/{endpoint}"
+        status, payload = self._request(path)
+        if status in (401, 403):
+            raise UniFiError(
+                f"Not authorized for Protect (HTTP {status}). An API key is "
+                f"granted to Protect separately from Network, so a key that "
+                f"reads devices can still be refused here."
+            )
+        if status == 404:
+            raise UniFiError(
+                f"{path} is not served by this console. Protect may not be "
+                f"installed, or this release predates the endpoint."
+            )
+        self._check_status(path, status)
+        if status != 200 or payload is None:
+            detail = payload.get("error", "") if isinstance(payload, dict) else ""
+            raise UniFiError(f"GET {path} failed: HTTP {status} {detail}".rstrip())
+        return payload
 
     def site_country(self):
         """Return the site's configured country code, or None. Cached.
@@ -624,6 +687,32 @@ def prune_old_copies(output_dir, stem, max_copies):
     return removed
 
 
+# A timestamped export folder, e.g. 2026-09-18_164512. prune_old_dirs refuses
+# to delete anything whose name does not look like this, so a stray --output-dir
+# cannot turn pruning into a recursive delete of someone's documents.
+EXPORT_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
+
+
+def prune_old_dirs(parent, max_copies):
+    """Delete the oldest timestamped export folders under parent; returns them."""
+    if max_copies <= 0:
+        return []
+    try:
+        folders = [
+            p for p in parent.iterdir() if p.is_dir() and EXPORT_DIR_PATTERN.match(p.name)
+        ]
+    except OSError:
+        return []
+    removed = []
+    for old in sorted(folders, key=lambda p: p.name, reverse=True)[max_copies:]:
+        try:
+            shutil.rmtree(old)
+            removed.append(old)
+        except OSError as err:
+            print(f"Warning: could not delete {old}: {err}", file=sys.stderr)
+    return removed
+
+
 def save_export(rows, columns, output_dir, stem, timestamp, max_copies):
     """Write a timestamped CSV, prune old copies, and return its path."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -670,7 +759,9 @@ if __name__ == "__main__":
 Run one of these instead (add --help for options):
 
   unifi-tools-export-devices.py   Export devices and/or clients to CSV
+  unifi-tools-export-protect.py   Export UniFi Protect devices and settings to CSV
   unifi-tools-export-wifi.py      Export WiFi networks (SSIDs) to CSV
+  unifi-tools-import-devices.py   Rename devices, set their IP and AP groups
   unifi-tools-import-wifi.py      Create or update WiFi networks from a CSV
 
 Example: python unifi-tools-export-wifi.py --host 192.168.1.1"""

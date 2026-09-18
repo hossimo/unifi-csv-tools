@@ -2,4 +2,4 @@
 - Redaction flag. --no-passwords on the WiFi export.
 - Group staging helper. Automate the workaround. --stage creates one device-tag per SSID, assigns a spare AP, imports, and reports what to fix at deploy time.
 - Output formats: --format csv|json|xlsx, or - to stdout for piping.
-- Retry/backoff on 429 and a --verbose / --log-file for scheduled runs.
+- A --verbose / --log-file for scheduled runs. (Retry/backoff on 429 is done: _request honours Retry-After.)

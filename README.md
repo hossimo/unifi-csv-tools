@@ -15,6 +15,7 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 | [`python unifi-tools-export-devices.py --host <console> --for-import`](#importing-devices) | Export devices in the shape the device import reads back |
 | [`python unifi-tools-import-devices.py <file.csv> --host <console>`](#importing-devices) | Rename devices, set their IP, and set AP groups from a CSV; add `--dry-run` first |
 | [`python unifi-tools-export-devices.py --host <console> --check`](#checking-for-settings-the-console-refuses) | Report devices whose saved settings the console would refuse to save |
+| [`python unifi-tools-export-protect.py --host <console>`](#protect) | Export UniFi Protect cameras, sensors, chimes and the rest to CSV |
 | [`python unifi-tools-import-devices.py --template`](#importing-devices) | Write a starter device CSV to fill in; no console needed |
 
 They all take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
@@ -202,6 +203,71 @@ python unifi-tools-import-devices.py devices.csv --host 192.168.1.1 --check --dr
 The other scripts use the official Network integration API. It can list devices, adopt one, restart one, and forget one — but it cannot rename a device, set its IP, or edit an AP group, so there is nothing there for this script to call. It uses the private API the UniFi UI itself uses instead (`/api/s/<site>/rest/device/<id>` and `/v2/api/site/<site>/apgroups/<id>`), which is undocumented and may change between Network releases. If a Network upgrade breaks it, that is why. The endpoints are named in one place, at the top of `_unifi_tools_common.py`.
 
 The integration API's read-only `device-tags` are the same objects as AP groups, under a different name.
+
+## Protect
+
+`unifi-tools-export-protect.py` exports UniFi Protect to CSV. Protect is a separate application behind the same console, so it needs no extra setup beyond an API key that is allowed to read it.
+
+```bash
+# Every Protect device (default)
+python unifi-tools-export-protect.py --host 192.168.1.1
+
+# One kind on its own, or everything including users
+python unifi-tools-export-protect.py --host 192.168.1.1 --what cameras
+python unifi-tools-export-protect.py --host 192.168.1.1 --what all
+```
+
+Each run writes **one timestamped folder**, holding one CSV per kind that has anything on the console:
+
+```
+exports/protect/2026-09-18_172236/
+  cameras.csv        3    liveviews.csv   6
+  sensors.csv        1    users.csv      27
+  chimes.csv         2
+  viewers.csv        1
+  fobs.csv           1
+  bridges.csv        1
+  link-stations.csv  1
+  nvr.csv            1
+```
+
+A kind gets its own file so that its columns are its own. Every kind carries the same envelope — `Name, Model, Status, MAC, ID` — and then adds fields that mean nothing to any other kind, so one shared file would be mostly empty cells:
+
+```
+cameras.csv   Name,Model,Status,MAC,Video Mode,HDR,Mic Enabled,Mic Volume,
+              Smart Detections,Audio Detections,OSD Name,OSD Date,Status LED,
+              Package Camera,ID
+chimes.csv    Name,Model,Status,MAC,Cameras,Ring Settings,ID
+nvr.csv       Name,Model,MAC,Arm Status,Arm Profile,Doorbell Message,ID
+```
+
+A kind with nothing on the console is named in a single line at the end rather than written as an empty file, so the folder only ever holds hardware you actually have.
+
+`--what` takes a group or a single kind:
+
+| `--what` | Writes |
+| --- | --- |
+| `devices` *(default)* | one file each for `cameras`, `lights`, `sensors`, `chimes`, `viewers`, `speakers`, `sirens`, `fobs`, `relays`, `bridges`, `link-stations`, `alarm-hubs`, `nvr` |
+| `config` | `liveviews.csv`, `arm-profiles.csv` |
+| `users` | `users.csv` — holds names and email addresses |
+| `all` | all of the above |
+| a kind name | just `<kind>.csv`, e.g. `--what sensors` |
+
+- **Users are left out of `devices` on purpose.** An inventory export shouldn't quietly collect people's email addresses, so ask for them by name with `--what users` or `--what all`.
+- **`users.csv` is the one file holding two endpoints.** Protect's own accounts and the UniFi identity ones describe the same people from two directions and carry the same columns, so they share a file with a `Source` column saying which produced each row rather than sitting in two near-identical files.
+- **`nvr.csv` has no `Status` column.** The NVR is the console itself rather than something attached to it, so the API gives it no connection state and the column is left out instead of written empty.
+- **MACs are rewritten as `aa:bb:cc:dd:ee:ff`.** Protect reports them as `AABBCCDDEEFF`; matching the device export means the two CSVs can be cross-referenced, and the console itself appears in both.
+- **Ids are resolved to names** where one endpoint points at another: a chime's cameras, a liveview's cameras, a viewer's liveview, a light's paired camera, the NVR's arm profile. If a lookup can't be fetched the id is left in place rather than blanked.
+- `--max-copies` prunes whole folders here rather than single files, and only ever deletes a folder named like a timestamp — a stray `--output-dir` cannot turn pruning into a recursive delete.
+- `--site` is refused, because Protect has one instance per console rather than sites. For several consoles, give each its own `--output-dir`.
+
+### What Protect does not expose
+
+There is **no firmware version, IP address, or recording/retention setting** in this export, because the integration API does not carry them. Unlike Network — where the private API accepts an API key, which is how the device import works — Protect's private API answers `401` to a key outright, so there is no second source to fall back on. The console serves its own OpenAPI spec at `https://<console>/proxy/protect/api-docs/integration.json`, but that wants a browser session rather than an API key; the browsable copy is under Control Plane > UniFi API > Protect.
+
+**Protect rate limits at ten requests a second**, much tighter than Network, and `--what all` walks seventeen endpoints. A `429` is waited out and retried using the `Retry-After` header the console sends, so this is handled rather than something to work around — but a console that stays throttled after four retries reports it and stops.
+
+Some endpoints are refused by a console depending on how it is set up: `arm-profiles` answers `400 This operation is not available when global alarm manager is enabled`, for instance. That is a normal state rather than a fault, so it is reported and skipped and the rest of the export still runs.
 
 ## Notes
 
