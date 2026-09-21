@@ -27,6 +27,7 @@ from _unifi_tools_common import (
     WIFI_COLUMNS,
     WIFI_ENDPOINT,
     UniFiError,
+    UniFiUnreachable,
     add_common_args,
     connect,
     export_dir,
@@ -130,6 +131,8 @@ def main():
     devices = client.list_site(DEVICE_ENDPOINT)
     try:
         device_tags = client.list_site(DEVICE_TAG_ENDPOINT)
+    except UniFiUnreachable:
+        raise
     except UniFiError as err:
         print(f"Warning: could not read AP groups: {err}", file=sys.stderr)
         device_tags = []

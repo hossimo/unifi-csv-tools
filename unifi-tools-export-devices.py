@@ -27,6 +27,7 @@ from _unifi_tools_common import (
     DEVICE_COLUMNS,
     LIST_SEPARATOR,
     UniFiError,
+    UniFiUnreachable,
     add_common_args,
     check_devices,
     connect,
@@ -240,6 +241,8 @@ def export_for_import(args, client, timestamp):
     devices = client.get(ENDPOINTS["devices"])
     try:
         groups = client.get_v2(AP_GROUP_ENDPOINT)
+    except UniFiUnreachable:
+        raise
     except UniFiError as err:
         print(f"Warning: could not read AP groups: {err}", file=sys.stderr)
         groups = []

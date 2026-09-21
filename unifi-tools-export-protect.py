@@ -47,6 +47,7 @@ from datetime import datetime
 from _unifi_tools_common import (
     LIST_SEPARATOR,
     UniFiError,
+    UniFiUnreachable,
     add_common_args,
     connect,
     export_dir,
@@ -374,6 +375,8 @@ def fetch_all(client, kinds):
     for kind in kinds:
         try:
             found = fetch(client, kind)
+        except UniFiUnreachable:
+            raise
         except UniFiError as err:
             # One missing endpoint should not cost the whole export; an older
             # Protect serves fewer of them than this script knows about.
@@ -403,6 +406,8 @@ def name_lookups(client, kinds):
                 for item in fetch(client, source)
                 if item.get("id")
             }
+        except UniFiUnreachable:
+            raise
         except UniFiError as err:
             print(f"Warning: cannot resolve {source} names: {err}", file=sys.stderr)
     return names

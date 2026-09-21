@@ -148,6 +148,15 @@ class UniFiError(Exception):
         self.code = code
 
 
+class UniFiUnreachable(UniFiError):
+    """Raised when the console did not answer at all.
+
+    Handlers that tolerate a failed request - an endpoint an older firmware
+    does not serve, a lookup worth doing without - let this one through, since
+    nothing else this run sends can succeed either.
+    """
+
+
 class UniFiClient:
     """Minimal API-key client for the UniFi Network API."""
 
@@ -192,7 +201,9 @@ class UniFiClient:
             except urllib.error.HTTPError as err:
                 status, raw, head = err.code, err.read(), err.headers
             except (urllib.error.URLError, OSError) as err:
-                raise UniFiError(f"Cannot reach {self.base_url}: {err}") from err
+                raise UniFiUnreachable(
+                    f"Cannot reach {self.base_url}: {err}"
+                ) from err
             if status != 429 or attempt == RATE_LIMIT_RETRIES:
                 break
             time.sleep(retry_after(head, attempt))
@@ -451,6 +462,8 @@ def check_device(client, device):
         client.put_legacy(
             f"{DEVICE_REST_ENDPOINT}/{device['_id']}", device_check_body(device)
         )
+    except UniFiUnreachable:
+        raise
     except UniFiError as err:
         return err.code or str(err)
     return None
