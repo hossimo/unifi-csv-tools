@@ -47,8 +47,23 @@ LIST_SEPARATOR = "; "  # Joins simple lists (e.g. tags) in one cell
 # Unless --api-key is given, the API key is read from this environment variable,
 # which may be set in a .env file next to these scripts. Real environment
 # variables take precedence over .env.
-ENV_API_KEY = "UNIFI_API_KEY"
+ENV_PREFIX = "UNIFI_"
+ENV_API_KEY = ENV_PREFIX + "API_KEY"
+ENV_PROFILE = ENV_PREFIX + "PROFILE"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+# Settings a [profile] section may carry, with the constant each falls back to.
+# A profile holds a whole console so that a second one costs a name on the
+# command line rather than a host, port, site and key every run.
+DEFAULT_PROFILE = "default"
+PROFILE_SETTINGS = {
+    "host": None,
+    "api_key": None,
+    "port": DEFAULT_PORT,
+    "site": DEFAULT_SITE,
+    "verify_ssl": VERIFY_SSL,
+}
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 # Network application API, proxied through UniFi OS
 API_PREFIX = "/proxy/network"
@@ -528,15 +543,31 @@ def check_devices(client, devices, stream=sys.stderr):
     return failures
 
 
-def load_env_file(path):
-    """Load KEY=VALUE lines into os.environ without overriding existing vars."""
+def parse_env_file(path):
+    """Parse a .env into {profile name: {KEY: value}}.
+
+    Keys written before the first section land under "" and are shared by every
+    profile, which keeps a .env that holds nothing but an API key working as it
+    did. [name] and [profile name] are the same heading, so a file is not
+    refused over which spelling it uses.
+    """
+    sections = {"": {}}
+    current = ""
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
-        return
+        return sections
     for line in lines:
         line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            if current.lower().startswith("profile "):
+                current = current[len("profile ") :].strip()
+            sections.setdefault(current, {})
+            continue
+        if "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
@@ -545,7 +576,98 @@ def load_env_file(path):
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        sections[current][key] = value
+    return sections
+
+
+def load_env_file(path):
+    """Load the shared KEY=VALUE lines into os.environ without overriding it.
+
+    A profile's own keys are left out and read by resolve_profile() instead, so
+    one console's API key cannot reach a run that asked for another.
+    """
+    for key, value in parse_env_file(path).get("", {}).items():
         os.environ.setdefault(key, value)
+
+
+def profile_setting(section, name):
+    """One setting's value in a parsed section; host and UNIFI_HOST both count."""
+    for key, value in section.items():
+        plain = key.strip().upper()
+        if plain.startswith(ENV_PREFIX):
+            plain = plain[len(ENV_PREFIX) :]
+        if plain == name.upper():
+            return value
+    return None
+
+
+def coerce_setting(name, value, parser=None):
+    """Turn a setting read from a file or the environment into its real type."""
+    if not isinstance(value, str):
+        return value
+    if name == "port":
+        try:
+            return int(value)
+        except ValueError:
+            fail(parser, f"port '{value}' is not a number")
+    if name == "verify_ssl":
+        return value.strip().lower() in TRUE_VALUES
+    return value.strip()
+
+
+def fail(parser, message):
+    """Report a configuration problem the way the running script reports errors."""
+    if parser:
+        parser.error(message)
+    raise UniFiError(message)
+
+
+def resolve_profile(args, parser=None):
+    """Fill in the connection options that were not given on the command line.
+
+    Order: the command line, the profile named by --profile or UNIFI_PROFILE,
+    the environment, the [default] profile, the shared keys, the constants at
+    the top of this file. A profile asked for by name outranks the environment
+    so that --profile reaches the console it names whatever the shell holds.
+    """
+    sections = parse_env_file(ENV_FILE)
+    name = (getattr(args, "profile", None) or os.environ.get(ENV_PROFILE, "")).strip()
+    chosen = {}
+    if name:
+        if not sections.get(name):
+            have = ", ".join(sorted(p for p in sections if p)) or "none"
+            fail(parser, f"no profile '{name}' in {ENV_FILE} (profiles: {have})")
+        chosen = sections[name]
+    # Read the environment before load_env_file() puts the shared keys into it,
+    # or those keys would arrive disguised as environment variables and outrank
+    # the [default] profile.
+    environ = {
+        setting: os.environ.get(ENV_PREFIX + setting.upper())
+        for setting in PROFILE_SETTINGS
+    }
+    load_env_file(ENV_FILE)
+    # A profile asked for by name must not borrow another profile's console or
+    # key, so [default] fills in only when no name was given.
+    fallback = {} if name else sections.get(DEFAULT_PROFILE, {})
+
+    for setting, default in PROFILE_SETTINGS.items():
+        if getattr(args, setting, None) is not None:
+            continue  # Given on the command line, which outranks every file
+        for value in (
+            profile_setting(chosen, setting),
+            environ[setting],
+            profile_setting(fallback, setting),
+            profile_setting(sections[""], setting),
+        ):
+            if value not in (None, ""):
+                setattr(args, setting, coerce_setting(setting, value, parser))
+                break
+        else:
+            setattr(args, setting, default)
+
+    if not args.host and getattr(parser, "_unifi_host_required", False):
+        fail(parser, f"--host is required (or set host in a {ENV_FILE.name} profile)")
+    return args
 
 
 def add_common_args(parser):
@@ -561,33 +683,40 @@ def add_connection_args(parser, host_required=True):
     they check args.host themselves.
     """
     parser.epilog = (
-        f"The API key is taken from --api-key, else {ENV_API_KEY} "
-        "(environment or .env file)."
+        f"Connection settings not given here are taken from the profile named by "
+        f"--profile, else {ENV_PROFILE}, else [{DEFAULT_PROFILE}] in "
+        f"{ENV_FILE.name}; {ENV_API_KEY} and the other {ENV_PREFIX}* environment "
+        f"variables are used when a profile does not set them."
     )
+    # A profile may carry the host, so argparse cannot tell whether one is
+    # missing; resolve_profile() checks once the profile has been read.
+    parser._unifi_host_required = host_required
     parser.add_argument(
         "--host",
-        required=host_required,
         help="Console address, e.g. 192.168.1.1",
     )
     parser.add_argument(
+        "--profile",
+        help=f"Which [profile] in {ENV_FILE.name} to use (default: {ENV_PROFILE} "
+        f"from the environment, else [{DEFAULT_PROFILE}])",
+    )
+    parser.add_argument(
         "--api-key",
-        help=f"API key (default: {ENV_API_KEY} from environment or .env)",
+        help=f"API key (default: the profile's, else {ENV_API_KEY})",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
         help=f"HTTPS port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(
         "--site",
-        default=DEFAULT_SITE,
         help=f"Site short name (default: {DEFAULT_SITE})",
     )
     parser.add_argument(
         "--verify-ssl",
         action="store_true",
-        default=VERIFY_SSL,
+        default=None,
         help="Verify the TLS certificate",
     )
 
@@ -622,8 +751,9 @@ def get_api_key(args):
         api_key = os.environ.get(ENV_API_KEY, "").strip()
     if not api_key:
         print(
-            f"Error: no API key. Use --api-key or set {ENV_API_KEY} "
-            f"in the environment or {ENV_FILE}.",
+            f"Error: no API key. Use --api-key, set {ENV_API_KEY} in the "
+            f"environment, or put one in {ENV_FILE} - under a [profile] "
+            f"section when there is more than one console.",
             file=sys.stderr,
         )
         return None

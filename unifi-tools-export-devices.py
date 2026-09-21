@@ -35,6 +35,7 @@ from _unifi_tools_common import (
     export_stem,
     new_timestamp,
     open_folder,
+    resolve_profile,
     run,
     save_export,
 )
@@ -211,7 +212,7 @@ def parse_args():
         )
     if args.check and args.what == "clients":
         parser.error("--check reads device settings; drop --what clients")
-    return args
+    return resolve_profile(args, parser)
 
 
 def run_check(client, devices):

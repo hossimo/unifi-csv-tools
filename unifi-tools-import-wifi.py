@@ -45,6 +45,7 @@ from _unifi_tools_common import (
     add_connection_args,
     connect,
     read_csv,
+    resolve_profile,
     run,
     write_csv,
 )
@@ -437,11 +438,13 @@ def parse_args():
             f"--template writes {args.template} and reads no csv; "
             f"drop '{args.csv}' or the option"
         )
-    if not args.template:
-        if not args.csv:
-            parser.error("the csv argument is required (or use --template)")
-        if not args.host:
-            parser.error("--host is required")
+    if args.template:
+        return args  # Writes a starter CSV and talks to no console
+    if not args.csv:
+        parser.error("the csv argument is required (or use --template)")
+    resolve_profile(args, parser)
+    if not args.host:
+        parser.error("--host is required (or set host in a .env profile)")
     return args
 
 

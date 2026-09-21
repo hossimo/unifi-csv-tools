@@ -53,6 +53,7 @@ from _unifi_tools_common import (
     export_dir,
     open_folder,
     prune_old_dirs,
+    resolve_profile,
     run,
     write_csv,
 )
@@ -433,10 +434,11 @@ def parse_args():
         help="Write MAC addresses in uppercase",
     )
     args = parser.parse_args()
-    # --site is a Network idea; Protect is one application per console
-    if args.site != parser.get_default("site"):
+    # --site is a Network idea; Protect is one application per console. Only
+    # the option is refused: a profile's site is there for the other scripts.
+    if args.site is not None:
         parser.error("Protect has no sites, so --site does not apply here")
-    return args
+    return resolve_profile(args, parser)
 
 
 def write(folder, filename, rows, columns):

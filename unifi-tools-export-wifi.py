@@ -34,6 +34,7 @@ from _unifi_tools_common import (
     export_stem,
     new_timestamp,
     open_folder,
+    resolve_profile,
     run,
     save_export,
 )
@@ -113,7 +114,7 @@ def parse_args():
         action="store_true",
         help="Also save the raw API responses as JSON (for inspecting fields)",
     )
-    return parser.parse_args()
+    return resolve_profile(parser.parse_args(), parser)
 
 
 def main():

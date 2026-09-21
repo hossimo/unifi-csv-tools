@@ -18,7 +18,7 @@ Works with UniFi OS consoles (UDM, UCG, UDR, Cloud Key Gen2+) using an API key.
 | [`python unifi-tools-export-protect.py --host <console>`](#protect) | Export UniFi Protect cameras, sensors, chimes and the rest to CSV |
 | [`python unifi-tools-import-devices.py --template`](#importing-devices) | Write a starter device CSV to fill in; no console needed |
 
-They all take `--host` (required, except for `--template`), `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
+They all take `--host` (required unless a profile or `--template` supplies it), `--profile`, `--api-key`, `--port`, `--site`, and `--verify-ssl`; add `--help` for the rest. `_unifi_tools_common.py` is shared code, not a command.
 
 ## Setup
 
@@ -28,7 +28,36 @@ Create an API key (Settings > Control Plane > Integrations) and put it in a `.en
 UNIFI_API_KEY=your-key-here
 ```
 
-`.env` is git-ignored. A `UNIFI_API_KEY` environment variable, if set, takes precedence over the file, and `--api-key` takes precedence over both.
+`.env` is git-ignored; `.env.example` next to it shows the full format.
+
+### More than one console
+
+Give each console a `[profile]` section, and a run picks one with `--profile` instead of repeating its address and key:
+
+```
+# shared by every profile
+UNIFI_API_KEY=fallback-key-here
+
+[default]
+host = 192.168.1.1
+api_key = key-for-the-main-console
+
+[branch]
+host = 10.10.0.1
+api_key = key-for-the-branch-console
+site = branch
+```
+
+```bash
+python unifi-tools-export-wifi.py                     # [default], no --host needed
+python unifi-tools-export-wifi.py --profile branch    # 10.10.0.1, site branch
+```
+
+A section may set `host`, `api_key`, `port`, `site` and `verify_ssl`, with or without the `UNIFI_` prefix (`host` and `UNIFI_HOST` are the same key). Anything it leaves out falls back to the environment, then to the keys written outside every section, then to the built-in defaults.
+
+`UNIFI_PROFILE` selects a profile for a whole shell, the way `--profile` does for one run. A profile named on either takes precedence over `UNIFI_HOST` and friends in the environment, so it always reaches the console it names; without one, those environment variables outrank the file. Command-line options beat everything.
+
+A named profile falls back to the shared keys but never to `[default]`, so `--profile branch` cannot end up holding the main console's key.
 
 Note that a key passed with `--api-key` may be visible to other users in the process list and saved in shell history.
 
@@ -43,8 +72,9 @@ python unifi-tools-export-devices.py --host 192.168.1.1 --what both --max-copies
 
 | Option | Default | Description |
 |---|---|---|
-| `--host` | *(required)* | Console address |
-| `--api-key` | `UNIFI_API_KEY` | API key; overrides the environment and `.env` |
+| `--host` | *(required)* | Console address; optional when a profile sets it |
+| `--profile` | `UNIFI_PROFILE`, else `[default]` | Which `.env` profile to connect with |
+| `--api-key` | the profile's, else `UNIFI_API_KEY` | API key; overrides the environment and `.env` |
 | `--port` | `443` | HTTPS port |
 | `--site` | `default` | Site short name (from the URL, not the display name) |
 | `--what` | `devices` | `devices`, `clients`, or `both` |
@@ -103,7 +133,7 @@ Replace the rows with your own before importing. The example networks and AP gro
 
 ### Importing
 
-`unifi-tools-import-wifi.py` creates SSIDs from a CSV in the same format. It takes the connection options (`--host`, `--api-key`, `--port`, `--site`, `--verify-ssl`) plus `--update` (below) and `--dry-run`, which prints each request (password hidden) without changing anything.
+`unifi-tools-import-wifi.py` creates SSIDs from a CSV in the same format. It takes the connection options (`--host`, `--profile`, `--api-key`, `--port`, `--site`, `--verify-ssl`) plus `--update` (below) and `--dry-run`, which prints each request (password hidden) without changing anything.
 
 ```bash
 python unifi-tools-import-wifi.py wifi.csv --host 192.168.1.1 --dry-run
